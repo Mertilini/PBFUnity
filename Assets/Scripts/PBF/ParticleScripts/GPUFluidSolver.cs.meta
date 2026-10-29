@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: 257f12a74687d4248baeb9357b7fb926
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences:
+  - aquarium: {instanceID: 0}
+  - computeShader: {instanceID: 0}
+  - prefab: {instanceID: 0}
+  executionOrder: 0
+  icon: {instanceID: 0}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 

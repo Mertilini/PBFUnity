@@ -1,0 +1,781 @@
+#pragma kernel PredictPosition
+#pragma kernel ClearGrid
+#pragma kernel BuildSpatialGrid
+#pragma kernel CalculateLambda
+#pragma kernel CalculatePositionUpdate
+#pragma kernel UpdatePositions
+#pragma kernel UpdateVelocities
+#pragma kernel CopyPositions
+#pragma kernel ApplyAquariumBoundaries
+
+struct Particle
+{
+    float3 pos;
+    float3 vel;
+    float3 predictedPos;
+    float mass;
+    uint isBoundary;
+    float3 vorticity;
+};
+
+StructuredBuffer<Particle> particlesIn;
+RWStructuredBuffer<Particle> particlesOut;
+
+RWStructuredBuffer<float> lambda_i;
+RWStructuredBuffer<float3> deltaQ_i;
+RWStructuredBuffer<uint> gridCounts;
+RWStructuredBuffer<uint> gridParticles;
+RWStructuredBuffer<float> pCorrection;
+
+float _dt;
+float _h;
+float _h2;
+float _rho0;
+int _particleCount;
+int _gridSize;
+float _pow2h;
+float _pow9h;
+float _pi;
+float _kernelconstant;
+float _kernelgradientconstant;
+float _spikygradientconstant;
+float _oneOverRho_0;
+float _delta_q;
+float _sTerm;
+float _sKernelValue;
+float _viscosityCoeff;
+float _vorticityStrength;
+float _sCorrK;
+int MAX_PER_CELL;
+float3 _aquariumMin;
+float3 _aquariumMax;
+float _wallSkin;
+
+float3 _aquariumMinVelocity;
+float3 _aquariumMaxVelocity;
+int _useSimulationLOD;
+
+struct BoxBoundary
+{
+    float4x4 worldToBox;
+    float4x4 boxToWorld;
+    float3 halfExtents;
+    float pad0;
+    float3 linearVelocity;
+    float pad1;
+    float3 angularVelocity;
+    float pad2;
+};
+
+StructuredBuffer<BoxBoundary> boxes;
+int _boxCount;
+
+#define THREADS 64
+
+uint HashCell(int3 cell)
+{
+    uint3 ucell = uint3(cell);
+
+    uint h = (ucell.x * 73856093u) ^
+             (ucell.y * 19349663u) ^
+             (ucell.z * 83492791u);
+
+    return h % (uint) _gridSize;
+}
+
+float CalculateSCorr(float poly6Term)
+{
+    float kernelValue = _kernelconstant * poly6Term * poly6Term * poly6Term;
+    return -_sCorrK * pow((kernelValue / _sKernelValue), 4);
+}
+
+void NearestBoxFace(int index, float3 pos, out float d, out float3 outwardNormal)
+{
+    BoxBoundary box = boxes[index];
+
+    float3 local = mul(box.worldToBox, float4(pos, 1.0)).xyz;
+
+    float3 q = abs(local) - box.halfExtents;
+
+    float3 nLocal;
+    if (q.x >= q.y && q.x >= q.z)
+    {
+        d = q.x;
+        nLocal = float3(local.x >= 0.0 ? 1.0 : -1.0, 0.0, 0.0);
+    }
+    else if (q.y >= q.z)
+    {
+        d = q.y;
+        nLocal = float3(0.0, local.y >= 0.0 ? 1.0 : -1.0, 0.0);
+    }
+    else
+    {
+        d = q.z;
+        nLocal = float3(0.0, 0.0, local.z >= 0.0 ? 1.0 : -1.0);
+    }
+
+    outwardNormal = normalize(mul((float3x3) box.boxToWorld, nLocal));
+}
+
+float3 PushOutOfBoxes(float3 pos)
+{
+    for (int b = 0; b < _boxCount; b++)
+    {
+        float d;
+        float3 n;
+        NearestBoxFace(b, pos, d, n);
+
+        if (d < _wallSkin)
+            pos += n * (_wallSkin - d);
+    }
+
+    return pos;
+}
+
+void AddMirrorWallDensity(float mass, float d, float3 outwardNormal, inout float density, inout float3 gradSum, inout float denomSum)
+{
+    float r = 2.0 * d;
+    if (r <= 0.0001f || r >= _h)
+        return;
+
+    float poly6Term = _pow2h - r * r;
+    density += mass * _kernelconstant * poly6Term * poly6Term * poly6Term;
+
+    float term = _h - r;
+    if (term <= 0.0)
+        return;
+
+    float3 gradientW = (_spikygradientconstant * term * term) * outwardNormal;
+    gradSum += gradientW;
+    denomSum += dot(gradientW, gradientW);
+}
+
+void AddMirrorWallDeltaQ(float d, float3 outwardNormal, float lambdaSelf, inout float3 deltaQ)
+{
+    float r = 2.0 * d;
+    if (r <= 0.0001f || r >= _h)
+        return;
+
+    float term = _h - r;
+    if (term <= 0.0)
+        return;
+
+    float3 gradientW = (_spikygradientconstant * term * term) * outwardNormal;
+
+    float poly6Term = _pow2h - r * r;
+    float sCorr = CalculateSCorr(poly6Term);
+
+    float lambdaSum = lambdaSelf + sCorr;
+
+    deltaQ += _oneOverRho_0 * lambdaSum * gradientW;
+}
+
+float3 CalculateVorticity(uint id)
+{
+    float3 omega_i = float3(0, 0, 0);
+
+    Particle p = particlesIn[id];
+
+    float3 pPos = p.predictedPos;
+
+    int3 centerCell = (int3) floor(pPos / _h);
+    for (int x = -1; x <= 1; x++)
+    {
+        for (int y = -1; y <= 1; y++)
+        {
+            for (int z = -1; z <= 1; z++)
+            {
+                int3 neighborCell = centerCell + int3(x, y, z);
+                uint hash = HashCell(neighborCell);
+                uint count = min(gridCounts[hash], MAX_PER_CELL);
+
+                for (uint k = 0; k < count; k++)
+                {
+                    uint neighborID = gridParticles[hash * MAX_PER_CELL + k];
+                    if (neighborID == id)
+                        continue;
+
+                    Particle neighbor = particlesIn[neighborID];
+
+                    float3 v_ij = neighbor.vel - p.vel;
+                    float3 r_vec = pPos - neighbor.predictedPos;
+
+                    float rSqr = dot(r_vec, r_vec);
+
+                    float r = length(r_vec);
+
+                    if (r < 0.0001f || r >= _h)
+                        continue;
+
+                    if (rSqr >= _pow2h || rSqr < 1e-8)
+                        continue;
+
+                    float term = _h - r;
+
+                    if (term > 0.0)
+                    {
+                        float gradientW_mag = _spikygradientconstant * term * term;
+                        float3 gradientW = gradientW_mag * (r_vec / r);
+
+                        omega_i += neighbor.mass * cross(v_ij, gradientW);
+                    }
+                }
+            }
+        }
+    }
+
+    return _oneOverRho_0 * omega_i;
+}
+
+float3 CalculateXSPHViscosity(uint id)
+{
+    Particle p = particlesIn[id];
+
+    float3 pPos = p.predictedPos;
+
+    float3 viscositySum = float3(0, 0, 0);
+
+    int3 centerCell = (int3) floor(pPos / _h);
+    for (int x = -1; x <= 1; x++)
+    {
+        for (int y = -1; y <= 1; y++)
+        {
+            for (int z = -1; z <= 1; z++)
+            {
+                int3 neighborCell = centerCell + int3(x, y, z);
+                uint hash = HashCell(neighborCell);
+                uint count = min(gridCounts[hash], MAX_PER_CELL);
+
+                for (uint k = 0; k < count; k++)
+                {
+                    uint neighborID = gridParticles[hash * MAX_PER_CELL + k];
+                    if (neighborID == id)
+                        continue;
+
+                    Particle neighbor = particlesIn[neighborID];
+
+                    float3 v_ij = neighbor.vel - p.vel;
+                    float3 r_vec = pPos - neighbor.predictedPos;
+
+                    float rSqr = dot(r_vec, r_vec);
+
+                    if (rSqr >= _pow2h || rSqr < 1e-8)
+                        continue;
+
+                    float term = _pow2h - rSqr;
+
+                    if (term > 0.0)
+                    {
+                        float kernelValue = _kernelconstant * term * term * term;
+
+                        viscositySum += neighbor.mass * v_ij * kernelValue;
+                    }
+                }
+            }
+        }
+    }
+
+    return _viscosityCoeff * _oneOverRho_0 * viscositySum;
+}
+
+float3 CalculateEta(uint id)
+{
+
+    Particle p = particlesIn[id];
+    float3 pPos = p.predictedPos;
+
+    float3 eta = float3(0, 0, 0);
+
+    float omega_i_mag = length(p.vorticity);
+
+    int3 centerCell = (int3) floor(pPos / _h);
+    for (int x = -1; x <= 1; x++)
+    {
+        for (int y = -1; y <= 1; y++)
+        {
+            for (int z = -1; z <= 1; z++)
+            {
+                int3 neighborCell = centerCell + int3(x, y, z);
+                uint hash = HashCell(neighborCell);
+                uint count = min(gridCounts[hash], MAX_PER_CELL);
+
+                for (uint k = 0; k < count; k++)
+                {
+                    uint neighborID = gridParticles[hash * MAX_PER_CELL + k];
+                    if (neighborID == id)
+                        continue;
+
+                    Particle neighbor = particlesIn[neighborID];
+
+                    float omega_j_mag = length(neighbor.vorticity);
+                    float diff = omega_j_mag - omega_i_mag;
+
+                    float3 r_vec = pPos - neighbor.predictedPos;
+
+                    float rSqr = dot(r_vec, r_vec);
+
+                    float r = length(r_vec);
+
+                    if (r < 0.0001f || r >= _h)
+                        continue;
+
+                    if (rSqr >= _pow2h || rSqr < 1e-8)
+                        continue;
+
+                    float term = _h - r;
+
+                    if (term > 0.0)
+                    {
+                        float gradientW_mag = _spikygradientconstant * term * term;
+                        float3 gradientW = gradientW_mag * (r_vec / r);
+
+                        eta += neighbor.mass * diff * gradientW;
+                    }
+                }
+            }
+        }
+    }
+
+    return _oneOverRho_0 * eta;
+}
+
+float3 CalculateCorrectiveForce(uint id)
+{
+    float3 eta = CalculateEta(id);
+
+    if (dot(eta, eta) < 1e-12)
+        return float3(0, 0, 0);
+
+    float3 locationVector = normalize(eta);
+
+    return _vorticityStrength * (cross(locationVector, particlesIn[id].vorticity));
+}
+
+[numthreads(THREADS, 1, 1)]
+void PredictPosition(uint id : SV_DispatchThreadID)
+{
+    if (id >= _particleCount)
+        return;
+
+    Particle p = particlesIn[id];
+    if (p.isBoundary == 1)
+    {
+        particlesOut[id] = p;
+        return;
+    }
+
+    p.vel += float3(0.0, -9.81, 0.0) * _dt;
+    p.predictedPos = p.pos + p.vel * _dt;
+    particlesOut[id] = p;
+}
+
+[numthreads(THREADS, 1, 1)]
+void ClearGrid(uint id : SV_DispatchThreadID)
+{
+    if (id < _gridSize)
+        gridCounts[id] = 0;
+}
+
+[numthreads(THREADS, 1, 1)]
+void BuildSpatialGrid(uint id : SV_DispatchThreadID)
+{
+    if (id >= _particleCount)
+        return;
+
+    float3 pos = particlesIn[id].predictedPos;
+    int3 cell = (int3) floor(pos / _h);
+
+    uint hash = HashCell(cell);
+
+    uint index;
+    InterlockedAdd(gridCounts[hash], 1, index);
+
+    if (index < MAX_PER_CELL)
+        gridParticles[hash * MAX_PER_CELL + index] = id;
+}
+
+[numthreads(THREADS, 1, 1)]
+void CalculateLambda(uint id : SV_DispatchThreadID)
+{
+    if (id >= _particleCount)
+        return;
+
+    Particle p = particlesIn[id];
+    if (p.isBoundary == 1)
+    {
+        lambda_i[id] = 0.0;
+        return;
+    }
+
+    int3 centerCell = (int3) floor(p.predictedPos / _h);
+
+    float selfDensity = p.mass * _kernelconstant * _pow2h * _pow2h * _pow2h;
+    float rho_i = selfDensity;
+
+    float denominator = 0.0;
+
+    float3 sumGradW = float3(0.0, 0.0, 0.0);
+
+    for (int x = -1; x <= 1; x++)
+    {
+        for (int y = -1; y <= 1; y++)
+        {
+            for (int z = -1; z <= 1; z++)
+            {
+                int3 neighborCell = centerCell + int3(x, y, z);
+                uint hash = HashCell(neighborCell);
+
+                uint count = min(gridCounts[hash], MAX_PER_CELL);
+
+                for (uint k = 0; k < count; k++)
+                {
+                    uint neighborID = gridParticles[hash * MAX_PER_CELL + k];
+                    if (neighborID == id)
+                        continue;
+
+                    Particle neighbor = particlesIn[neighborID];
+
+                    float3 r_vec = particlesIn[id].predictedPos - neighbor.predictedPos;
+
+                    float rSqr = dot(r_vec, r_vec);
+                    float r = length(r_vec);
+
+                    if (r < 0.0001f || r >= _h)
+                        continue;
+
+                    if (rSqr >= _pow2h || rSqr < 1e-8)
+                        continue;
+
+                    float term = _h - r;
+
+                    if (term > 0.0)
+                    {
+                        float poly6Term = _pow2h - rSqr;
+                        float kernelValue = _kernelconstant * poly6Term * poly6Term * poly6Term;
+                        rho_i += neighbor.mass * kernelValue;
+
+                        float gradientW_mag = _spikygradientconstant * term * term;
+                        float3 gradientW = gradientW_mag * (r_vec / r);
+
+                        denominator += dot(gradientW, gradientW);
+
+                        sumGradW += gradientW;
+                    }
+                }
+            }
+
+        }
+
+    }
+
+    AddMirrorWallDensity(p.mass, p.predictedPos.x - _aquariumMin.x, float3(1, 0, 0), rho_i, sumGradW, denominator);
+    AddMirrorWallDensity(p.mass, _aquariumMax.x - p.predictedPos.x, float3(-1, 0, 0), rho_i, sumGradW, denominator);
+    AddMirrorWallDensity(p.mass, p.predictedPos.y - _aquariumMin.y, float3(0, 1, 0), rho_i, sumGradW, denominator);
+    AddMirrorWallDensity(p.mass, _aquariumMax.y - p.predictedPos.y, float3(0, -1, 0), rho_i, sumGradW, denominator);
+    AddMirrorWallDensity(p.mass, p.predictedPos.z - _aquariumMin.z, float3(0, 0, 1), rho_i, sumGradW, denominator);
+    AddMirrorWallDensity(p.mass, _aquariumMax.z - p.predictedPos.z, float3(0, 0, -1), rho_i, sumGradW, denominator);
+
+    for (int b = 0; b < _boxCount; b++)
+    {
+        float boxD;
+        float3 boxN;
+        NearestBoxFace(b, p.predictedPos, boxD, boxN);
+
+        if (boxD > 0.0)
+            AddMirrorWallDensity(p.mass, boxD, boxN, rho_i, sumGradW, denominator);
+    }
+
+    denominator += dot(sumGradW, sumGradW);
+
+    denominator /= (_rho0 * _rho0);
+
+    if (isnan(denominator) || isinf(denominator))
+        denominator = 0.00001;
+
+    if (denominator < 1e-4)
+        denominator = 1e-4;
+
+    float C_i = max(rho_i / _rho0 - 1, 0);
+    lambda_i[id] = -C_i / denominator;
+    lambda_i[id] = clamp(lambda_i[id], -1000, 0);
+
+    if (isnan(lambda_i[id]) || isinf(lambda_i[id]))
+        lambda_i[id] = 0.0;
+}
+
+[numthreads(THREADS, 1, 1)]
+void CalculatePositionUpdate(uint id : SV_DispatchThreadID)
+{
+    if (id >= _particleCount)
+        return;
+
+    Particle p = particlesIn[id];
+    if (p.isBoundary == 1)
+    {
+        deltaQ_i[id] = float3(0.0, 0.0, 0.0);
+        return;
+    }
+
+    float3 pPos = p.predictedPos;
+    float3 Delta_q = float3(0.0, 0.0, 0.0);
+    int3 centerCell = (int3) floor(pPos / _h);
+
+    for (int x = -1; x <= 1; x++)
+    {
+        for (int y = -1; y <= 1; y++)
+        {
+            for (int z = -1; z <= 1; z++)
+            {
+                int3 neighborCell = centerCell + int3(x, y, z);
+                uint hash = HashCell(neighborCell);
+                uint count = min(gridCounts[hash], MAX_PER_CELL);
+
+                for (uint k = 0; k < count; k++)
+                {
+                    uint neighborID = gridParticles[hash * MAX_PER_CELL + k];
+                    if (neighborID == id)
+                        continue;
+
+                    Particle neighbor = particlesIn[neighborID];
+                    float3 r_vec = pPos - neighbor.predictedPos;
+                    float rSqr = dot(r_vec, r_vec);
+
+                    float r = length(r_vec);
+
+                    if (r < 0.0001f || r >= _h)
+                        continue;
+
+                    if (rSqr >= _pow2h || rSqr < 1e-8)
+                        continue;
+
+                    float term = _h - r;
+                    float gradW_mag = _spikygradientconstant * term * term;
+                    float3 gradientW = gradW_mag * (r_vec / r);
+
+                    float poly6Term = _pow2h - rSqr;
+                    float sCorr = CalculateSCorr(poly6Term);
+
+                    float lambdaSum = lambda_i[id] + (neighbor.isBoundary ? 0.0f : lambda_i[neighborID]) + sCorr;
+
+                    Delta_q += _oneOverRho_0 * lambdaSum * gradientW;
+                }
+            }
+        }
+    }
+
+    AddMirrorWallDeltaQ(pPos.x - _aquariumMin.x, float3(1, 0, 0), lambda_i[id], Delta_q);
+    AddMirrorWallDeltaQ(_aquariumMax.x - pPos.x, float3(-1, 0, 0), lambda_i[id], Delta_q);
+    AddMirrorWallDeltaQ(pPos.y - _aquariumMin.y, float3(0, 1, 0), lambda_i[id], Delta_q);
+    AddMirrorWallDeltaQ(_aquariumMax.y - pPos.y, float3(0, -1, 0), lambda_i[id], Delta_q);
+    AddMirrorWallDeltaQ(pPos.z - _aquariumMin.z, float3(0, 0, 1), lambda_i[id], Delta_q);
+    AddMirrorWallDeltaQ(_aquariumMax.z - pPos.z, float3(0, 0, -1), lambda_i[id], Delta_q);
+
+    for (int b = 0; b < _boxCount; b++)
+    {
+        float boxD;
+        float3 boxN;
+        NearestBoxFace(b, pPos, boxD, boxN);
+
+        if (boxD > 0.0)
+            AddMirrorWallDeltaQ(boxD, boxN, lambda_i[id], Delta_q);
+    }
+
+    Delta_q *= 0.85f;
+
+    if (!isfinite(Delta_q.x) || !isfinite(Delta_q.y) || !isfinite(Delta_q.z))
+        Delta_q = float3(0.0, 0.0, 0.0);
+
+    float maxCorrection = _h * 0.3f;
+    Delta_q = clamp(Delta_q, -float3(maxCorrection, maxCorrection, maxCorrection), float3(maxCorrection, maxCorrection, maxCorrection));
+
+    deltaQ_i[id] = Delta_q;
+}
+
+[numthreads(THREADS, 1, 1)]
+void UpdatePositions(uint id : SV_DispatchThreadID)
+{
+    if (id >= _particleCount)
+        return;
+
+    Particle p = particlesIn[id];
+
+    if (p.isBoundary == 1)
+    {
+        particlesOut[id] = p;
+        return;
+    }
+
+    p.predictedPos += deltaQ_i[id];
+
+    p.predictedPos = clamp(p.predictedPos, _aquariumMin + _wallSkin, _aquariumMax - _wallSkin);
+
+    p.predictedPos = PushOutOfBoxes(p.predictedPos);
+
+    particlesOut[id] = p;
+}
+
+[numthreads(THREADS, 1, 1)]
+void UpdateVelocities(uint id : SV_DispatchThreadID)
+{
+    if (id >= _particleCount)
+        return;
+
+    Particle p = particlesIn[id];
+
+    if (p.isBoundary == 1)
+    {
+        particlesOut[id] = p;
+        return;
+    }
+
+    float3 omega_i = CalculateVorticity(id);
+
+    float3 velocityFromPosition = (p.predictedPos - p.pos) / _dt;
+    velocityFromPosition += CalculateXSPHViscosity(id);
+
+    bool nearSurface = lambda_i[id] >= 0.0;
+
+    if (_useSimulationLOD == 0 || nearSurface)
+    {
+        float3 correctiveForce = CalculateCorrectiveForce(id);
+        velocityFromPosition += correctiveForce * _dt;
+    }
+
+    float maxSpeed = 15.0f;
+    float speedSqr = dot(velocityFromPosition, velocityFromPosition);
+
+    if (speedSqr > maxSpeed * maxSpeed)
+    {
+        velocityFromPosition = normalize(velocityFromPosition) * maxSpeed;
+    }
+
+    velocityFromPosition *= 0.995f;
+
+    if (dot(velocityFromPosition, velocityFromPosition) < 0.0001f)
+        velocityFromPosition = float3(0, 0, 0);
+
+    float movementDistance = length(p.predictedPos - p.pos);
+
+    if (movementDistance < (_h * 0.001f))
+    {
+        velocityFromPosition = float3(0, 0, 0);
+        p.predictedPos = p.pos;
+    }
+
+    p.vel = velocityFromPosition;
+    p.pos = p.predictedPos;
+    p.vorticity = omega_i;
+
+    particlesOut[id] = p;
+}
+
+RWStructuredBuffer<float3> positionBuffer;
+
+uint _renderOffset;
+
+[numthreads(THREADS, 1, 1)]
+void CopyPositions(uint id : SV_DispatchThreadID)
+{
+    uint src = id + _renderOffset;
+    if (src >= _particleCount)
+        return;
+
+    Particle p = particlesIn[src];
+    positionBuffer[id] = p.pos;
+}
+
+float _boundaryRestitution;
+float _boundaryFriction;
+
+[numthreads(THREADS, 1, 1)]
+void ApplyAquariumBoundaries(uint id : SV_DispatchThreadID)
+{
+    if (id >= _particleCount)
+        return;
+
+    Particle p = particlesIn[id];
+    if (p.isBoundary == 1)
+    {
+        particlesOut[id] = p;
+        return;
+    }
+
+    float3 pos = p.predictedPos;
+    float3 vel = p.vel;
+    bool touchedWall = false;
+
+    float3 wallMin = _aquariumMin + _wallSkin;
+    float3 wallMax = _aquariumMax - _wallSkin;
+
+    if (pos.x <= wallMin.x)
+    {
+        pos.x = wallMin.x;
+        vel.x = _aquariumMinVelocity.x - (vel.x - _aquariumMinVelocity.x) * _boundaryRestitution;
+        touchedWall = true;
+    }
+    else if (pos.x >= wallMax.x)
+    {
+        pos.x = wallMax.x;
+        vel.x = _aquariumMaxVelocity.x - (vel.x - _aquariumMaxVelocity.x) * _boundaryRestitution;
+        touchedWall = true;
+    }
+
+    if (pos.y <= wallMin.y)
+    {
+        pos.y = wallMin.y;
+
+        vel.y = _aquariumMinVelocity.y + abs(vel.y - _aquariumMinVelocity.y) * _boundaryRestitution;
+        touchedWall = true;
+    }
+    else if (pos.y >= wallMax.y)
+    {
+        pos.y = wallMax.y;
+        vel.y = _aquariumMaxVelocity.y - abs(vel.y - _aquariumMaxVelocity.y) * _boundaryRestitution;
+        touchedWall = true;
+    }
+
+    if (pos.z <= wallMin.z)
+    {
+        pos.z = wallMin.z;
+        vel.z = _aquariumMinVelocity.z - (vel.z - _aquariumMinVelocity.z) * _boundaryRestitution;
+        touchedWall = true;
+    }
+    else if (pos.z >= wallMax.z)
+    {
+        pos.z = wallMax.z;
+        vel.z = _aquariumMaxVelocity.z - (vel.z - _aquariumMaxVelocity.z) * _boundaryRestitution;
+        touchedWall = true;
+    }
+
+    for (int b = 0; b < _boxCount; b++)
+    {
+        float boxD;
+        float3 boxN;
+        NearestBoxFace(b, pos, boxD, boxN);
+
+        if (boxD < _wallSkin)
+        {
+            pos += boxN * (_wallSkin - boxD);
+
+            float3 boxCentre = float3(boxes[b].boxToWorld._m03, boxes[b].boxToWorld._m13, boxes[b].boxToWorld._m23);
+            float3 wallVel = boxes[b].linearVelocity + cross(boxes[b].angularVelocity, pos - boxCentre);
+
+            float3 relative = vel - wallVel;
+            float into = dot(relative, boxN);
+            if (into < 0.0)
+                relative -= (1.0 + _boundaryRestitution) * into * boxN;
+
+            vel = relative + wallVel;
+
+            touchedWall = true;
+        }
+    }
+
+    if (touchedWall)
+        vel *= _boundaryFriction;
+
+    p.pos = pos;
+    p.predictedPos = pos;
+    p.vel = vel;
+    particlesOut[id] = p;
+}

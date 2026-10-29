@@ -1,0 +1,100 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1001 &8570733280146155550
+PrefabInstance:
+  m_ObjectHideFlags: 0
+  serializedVersion: 2
+  m_Modification:
+    serializedVersion: 3
+    m_TransformParent: {fileID: 0}
+    m_Modifications:
+    - target: {fileID: -8679921383154817045, guid: e75f8531fc004ac43bc52015497ea2f0, type: 3}
+      propertyPath: m_LocalScale.x
+      value: 10000
+      objectReference: {fileID: 0}
+    - target: {fileID: -8679921383154817045, guid: e75f8531fc004ac43bc52015497ea2f0, type: 3}
+      propertyPath: m_LocalScale.y
+      value: 10000
+      objectReference: {fileID: 0}
+    - target: {fileID: -8679921383154817045, guid: e75f8531fc004ac43bc52015497ea2f0, type: 3}
+      propertyPath: m_LocalScale.z
+      value: 10000
+      objectReference: {fileID: 0}
+    - target: {fileID: -8679921383154817045, guid: e75f8531fc004ac43bc52015497ea2f0, type: 3}
+      propertyPath: m_LocalPosition.x
+      value: 4.343857
+      objectReference: {fileID: 0}
+    - target: {fileID: -8679921383154817045, guid: e75f8531fc004ac43bc52015497ea2f0, type: 3}
+      propertyPath: m_LocalPosition.y
+      value: -0.032984734
+      objectReference: {fileID: 0}
+    - target: {fileID: -8679921383154817045, guid: e75f8531fc004ac43bc52015497ea2f0, type: 3}
+      propertyPath: m_LocalPosition.z
+      value: -7.739848
+      objectReference: {fileID: 0}
+    - target: {fileID: -8679921383154817045, guid: e75f8531fc004ac43bc52015497ea2f0, type: 3}
+      propertyPath: m_LocalRotation.w
+      value: 0.2588187
+      objectReference: {fileID: 0}
+    - target: {fileID: -8679921383154817045, guid: e75f8531fc004ac43bc52015497ea2f0, type: 3}
+      propertyPath: m_LocalRotation.x
+      value: 0.0000000056566627
+      objectReference: {fileID: 0}
+    - target: {fileID: -8679921383154817045, guid: e75f8531fc004ac43bc52015497ea2f0, type: 3}
+      propertyPath: m_LocalRotation.y
+      value: -0.96592593
+      objectReference: {fileID: 0}
+    - target: {fileID: -8679921383154817045, guid: e75f8531fc004ac43bc52015497ea2f0, type: 3}
+      propertyPath: m_LocalRotation.z
+      value: -0.000000021110983
+      objectReference: {fileID: 0}
+    - target: {fileID: -8679921383154817045, guid: e75f8531fc004ac43bc52015497ea2f0, type: 3}
+      propertyPath: m_LocalEulerAnglesHint.x
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: -8679921383154817045, guid: e75f8531fc004ac43bc52015497ea2f0, type: 3}
+      propertyPath: m_LocalEulerAnglesHint.y
+      value: -150
+      objectReference: {fileID: 0}
+    - target: {fileID: -8679921383154817045, guid: e75f8531fc004ac43bc52015497ea2f0, type: 3}
+      propertyPath: m_LocalEulerAnglesHint.z
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 919132149155446097, guid: e75f8531fc004ac43bc52015497ea2f0, type: 3}
+      propertyPath: m_Name
+      value: Bunny
+      objectReference: {fileID: 0}
+    m_RemovedComponents: []
+    m_RemovedGameObjects: []
+    m_AddedGameObjects: []
+    m_AddedComponents:
+    - targetCorrespondingSourceObject: {fileID: 919132149155446097, guid: e75f8531fc004ac43bc52015497ea2f0, type: 3}
+      insertIndex: -1
+      addedObject: {fileID: 7112898452992809837}
+  m_SourcePrefab: {fileID: 100100000, guid: e75f8531fc004ac43bc52015497ea2f0, type: 3}
+--- !u!1 &8804595905727026511 stripped
+GameObject:
+  m_CorrespondingSourceObject: {fileID: 919132149155446097, guid: e75f8531fc004ac43bc52015497ea2f0, type: 3}
+  m_PrefabInstance: {fileID: 8570733280146155550}
+  m_PrefabAsset: {fileID: 0}
+--- !u!114 &7112898452992809837
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 8804595905727026511}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 65ea29a1121193c4b94ad061018ddc72, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::CreateBoundary
+  solver: {fileID: 0}
+  spacingOverride: 0.12
+  mass: 1
+  oversample: 4
+  layers: 1
+  seed: 12345
+  drawGizmos: 1
+  gizmoColor: {r: 1, g: 0.6, b: 0.1, a: 1}
+  maxGizmos: 20000
